@@ -31,6 +31,7 @@ def sheet_member(archive, name):
 
 
 def rows(archive, member):
+    """Yield one row at a time; callers may re-open the same member."""
     previous_row = 0
     with archive.open(member) as source:
         stack = []

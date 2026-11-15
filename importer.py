@@ -2,19 +2,28 @@ import argparse
 import json
 import os
 import tempfile
-import zipfile
 import xml.etree.ElementTree as ET
+import zipfile
 from errors import IngestError
 from formulas import SharedFormulas
 from xlsx_rows import rows, sheet_member
 
 
 def extract(source, sheet, sink):
-    """Internal streaming worker; sink is private until ingest commits."""
+    """Internal streaming worker; sink is private until ingest commits.
+
+    The worksheet is read twice on the same open stream: the first pass indexes
+    shared-formula masters (a master may appear after its followers), the second
+    pass resolves and emits rows in the original order.  Only the shared
+    definition table persists between passes; rows are never retained.
+    """
     try:
         with zipfile.ZipFile(source) as archive:
             member = sheet_member(archive, sheet)
             registry = SharedFormulas()
+            for row in rows(archive, member):
+                for cell in row:
+                    registry.register(cell)
             count = 0
             for row in rows(archive, member):
                 for cell in row:

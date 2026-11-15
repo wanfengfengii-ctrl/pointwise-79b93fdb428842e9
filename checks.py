@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import zipfile
 from errors import IngestError
 from importer import extract, ingest
 from samples import cell, worksheet, workbook, normal_book, late_book, lexical_book
@@ -50,6 +51,130 @@ def incident():
     return int(broken)
 
 
+MASTER_21 = 'SUM($A1:B$1)+"A1""B2"+1E10+TRUE+_xlfn.X(A1)+LOG10 (B$1)'
+MASTER_22 = "'O''Brien'!A1+'A1 log'!B2+'Q1 log'!A$1+$B2"
+
+
+def boundary_book():
+    return workbook(worksheet([
+        (1, [cell('A1', '5'),
+             cell('B1', '1', MASTER_21, 21, 'B1:D2'),
+             cell('C1', '2', si=21),
+             cell('D1', '6', 'B1+1')]),
+        (2, [cell('A2', '3', MASTER_22, '022', 'A2:C2'),
+             cell('B2', '4', si=21),
+             cell('C2', '5', si=22),
+             cell('D2', '7', si=21)])]))
+
+
+def rejects(xml, reason):
+    try:
+        read(workbook(xml))
+    except IngestError as error:
+        assert reason in str(error), (reason, str(error))
+        return
+    raise AssertionError('INVALID_SHARED_GROUP_ACCEPTED:' + reason)
+
+
+def boundaries():
+    actual = read(boundary_book())
+    assert actual == [
+        record('A1', '5'),
+        record('B1', '1', MASTER_21),
+        record('C1', '2', 'SUM($A1:C$1)+"A1""B2"+1E10+TRUE+_xlfn.X(B1)+LOG10 (C$1)'),
+        record('D1', '6', 'B1+1'),
+        record('A2', '3', MASTER_22),
+        record('B2', '4', 'SUM($A2:B$1)+"A1""B2"+1E10+TRUE+_xlfn.X(A2)+LOG10 (B$1)'),
+        record('C2', '5', "'O''Brien'!C1+'A1 log'!D2+'Q1 log'!C$1+$B2"),
+        record('D2', '7', 'SUM($A2:D$1)+"A1""B2"+1E10+TRUE+_xlfn.X(C2)+LOG10 (D$1)')]
+    assert read(workbook(worksheet([
+        (1, [cell('A1', '1', 'B2+C$3', 1, 'A1')])]))) == [record('A1', '1', 'B2+C$3')]
+    # A formula without a cached value still emits its cell.
+    assert read(workbook(worksheet([
+        (1, [cell('B1', None, 'A1', 11, 'B1:B2')]),
+        (2, [cell('B2', None, si=11)])]))) == [
+            record('B1', None, 'A1'), record('B2', None, 'A2')]
+    # si identity is numeric: "0007" in a follower matches master si=7.
+    assert read(workbook(worksheet([
+        (1, [cell('B1', '1', 'A1', 7, 'B1:B2')]),
+        (2, [cell('B2', '2', si='0007')])]))) == [
+            record('B1', '1', 'A1'), record('B2', '2', 'A2')]
+    rejects(worksheet([(1, [cell('B1', '1', si=8)])]), 'MISSING_SHARED_DEFINITION')
+    rejects(worksheet([(1, [cell('B1', '1', 'A1', 2, 'B1:B3')]),
+                       (3, [cell('B3', '3', 'A3+1', 2, 'B1:B3')])]),
+            'CONFLICTING_SHARED_DEFINITION')
+    rejects(worksheet([(1, [cell('B1', '1', 'A1', 2, 'B1:B3')]),
+                       (2, [cell('B2', '2', 'A1', 2, 'B1:B3')])]),
+            'DUPLICATE_SHARED_DEFINITION')
+    rejects(worksheet([(1, [cell('B1', '1', si=9)]),
+                       (3, [cell('B3', '3', 'A3', 9, 'B2:B3')])]),
+            'FOLLOWER_OUTSIDE_RANGE')
+    rejects(worksheet([(1, [cell('A1', '1', 'B2', 5, 'A1:XFD2')]),
+                       (2, [cell('XFD2', '2', si=5)])]),
+            'REFERENCE_OUT_OF_GRID')
+    rejects(worksheet([(3, [cell('A3', '2', si=6),
+                            cell('C3', '1', 'B1', 6, 'A3:C3')])]),
+            'REFERENCE_OUT_OF_GRID')
+    rejects(worksheet([(2, [cell('B2', '1', 'A1', 3, 'B3:B1')])]),
+            'BAD_SHARED_RANGE')
+    rejects(worksheet([(2, [cell('B2', '1', 'A1', 3, 'A1:B1')])]),
+            'MASTER_OUTSIDE_RANGE')
+    rejects(worksheet([(1, [cell('B1', '1', 'A1', 3)])]), 'MISSING_SHARED_RANGE')
+    rejects(worksheet([(1, [cell('B1', '1', 'A1', 3, 'B1:B2')]),
+                       (2, [cell('B2', '2', None, 3, 'B1:B2')])]),
+            'FOLLOWER_HAS_RANGE')
+    rejects(worksheet([(1, [cell('B1', '1', 'A1', 'x', 'B1')])]), 'BAD_SHARED_ID')
+    print('BOUNDARY_REGRESSION_OK')
+
+
+class _LimitedReader:
+    """Wrap a ZIP member so positive-size reads never exceed a fixed chunk."""
+
+    def __init__(self, stream, chunk):
+        self._stream = stream
+        self._chunk = chunk
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            return self._stream.read()
+        return self._stream.read(min(size, self._chunk))
+
+    def close(self):
+        self._stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def chunked():
+    original = zipfile.ZipFile.open
+    limit = [4096]
+
+    def opening(archive, name, mode='r', *args, **kwargs):
+        return _LimitedReader(original(archive, name, mode, *args, **kwargs),
+                              limit[0])
+
+    books = [normal_book(), late_book(), lexical_book(), boundary_book()]
+    try:
+        reference = []
+        for book in books:
+            book.seek(0)
+            reference.append(read(book))
+        zipfile.ZipFile.open = opening
+        for size in (1, 13, 4096, 16384, 200000):
+            limit[0] = size
+            for book, wanted in zip(books, reference):
+                book.seek(0)
+                assert read(book) == wanted, 'CHUNK_DEPENDENT_RESULT:%d' % size
+    finally:
+        zipfile.ZipFile.open = original
+    print('ZIP_CHUNK_INVARIANCE_OK')
+
+
 def disk_checks():
     with tempfile.TemporaryDirectory() as directory:
         source = os.path.join(directory, 'source.xlsx')
@@ -62,7 +187,16 @@ def disk_checks():
             worksheet([(1, [cell('B1', '1', si=8)]),
                        (3, [cell('B3', '3', 'A3', 8, 'B2:B3')])]),
             worksheet([(1, [cell('B1', '1', 'A1', 2, 'B1:B3')]),
-                       (3, [cell('B3', '3', 'A3+1', 2, 'B1:B3')])])]
+                       (3, [cell('B3', '3', 'A3+1', 2, 'B1:B3')])]),
+            worksheet([(1, [cell('B1', '1', 'A1', 2, 'B1:B3')]),
+                       (3, [cell('B3', '3', 'A1', 2, 'B1:B3')])]),
+            worksheet([(1, [cell('A1', '1', 'B1', 5, 'A1:XFD2')]),
+                       (2, [cell('XFD2', '2', si=5)])]),
+            # Deep failure: thousands of valid rows are staged before the
+            # follower at the end shifts a reference off the grid.
+            worksheet([(r, [cell('B%d' % r, str(r))]) for r in range(1, 2001)]
+                      + [(2001, [cell('C2001', '1', 'A1048576', 6, 'C2001:C2002')]),
+                         (2002, [cell('C2002', '2', si=6)])])]
         for xml in invalids:
             with open(source, 'wb') as f:
                 f.write(workbook(xml).getvalue())
@@ -121,6 +255,8 @@ def resources():
                 assert count == size
             assert sorted(os.listdir(directory)) == ['large.jsonl', 'large.xlsx']
             measurements.append(dict(rows=size, peak_bytes=peak))
+    assert measurements[1]['peak_bytes'] <= measurements[0]['peak_bytes'] * 1.5 + 65536, \
+        'MEMORY_GROWS_WITH_ROW_COUNT'
     print(json.dumps({'disk_resource_measurements': measurements}, sort_keys=True))
 
 
@@ -139,8 +275,14 @@ if __name__ == '__main__':
         normal()
         if incident():
             raise SystemExit(1)
+        boundaries()
+        chunked()
         disk_checks()
         resources()
+    elif mode == 'boundaries':
+        boundaries()
+    elif mode == 'chunked':
+        chunked()
     elif mode == 'resources':
         resources()
     elif mode == 'demo':
